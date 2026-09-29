@@ -129,7 +129,7 @@ func (e *Env) generateLinuxUserData(n *Node) string {
 
 	// Remove the default route from the debug NIC (enp0s4) so traffic goes through vnet.
 	// The debug NIC is only for SSH access from the host.
-	ud.WriteString("  - [\"/bin/sh\", \"-c\", \"ip route del default via 10.0.2.2 dev enp0s4 2>/dev/null || true\"]\n")
+	ud.WriteString("  - [\"/bin/sh\", \"-c\", \"ip route del default via 10.0.2.2 2>/dev/null || true\"]\n")
 
 	// Download binaries from the files.tailscale VIP (52.52.0.6).
 	// Use the IP directly to avoid DNS resolution issues during early boot.

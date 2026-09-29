@@ -470,6 +470,7 @@ type Node struct {
 	webServerPort    int
 	sshPort          int     // host port for SSH debug access (cloud VMs only)
 	dnsMode          DNSMode // desired Linux DNS backend to provision; "" means the image default
+	qmpPath          string // socket path for talking to the QEMU process for the node
 }
 
 // AddNode creates a new VM node. The name is used for identification and as the
@@ -571,15 +572,17 @@ func (n *Node) LanIP(net *vnet.Network) netip.Addr {
 }
 
 // NodeOption types for configuring nodes.
-type nodeOptOS OSImage
-type nodeOptNoTailscale struct{}
-type nodeOptTailscaleSSH struct{}
-type nodeOptNoAgent struct{}
-type nodeOptSystemdUnit struct{}
-type nodeOptAdvertiseRoutes string
-type nodeOptSNATSubnetRoutes bool
-type nodeOptWebServer int
-type nodeOptDNSMode DNSMode
+type (
+	nodeOptOS               OSImage
+	nodeOptNoTailscale      struct{}
+	nodeOptTailscaleSSH     struct{}
+	nodeOptNoAgent          struct{}
+	nodeOptSystemdUnit      struct{}
+	nodeOptAdvertiseRoutes  string
+	nodeOptSNATSubnetRoutes bool
+	nodeOptWebServer        int
+	nodeOptDNSMode          DNSMode
+)
 
 // DNSMode is a provisioning directive, not a DNS-backend name: it says what, if
 // anything, to do to the guest's DNS before tailscaled starts, letting one
@@ -755,7 +758,7 @@ func (e *Env) Start() {
 				}
 				t.Logf("[%s] agent connected, backend state: %s", n.name, st.BackendState)
 			} else {
-				if err := e.waitForAgentConn(ctx, n); err != nil {
+				if err := e.WaitForAgentConn(ctx, n); err != nil {
 					return fmt.Errorf("[%s] agent connect: %w", n.name, err)
 				}
 				t.Logf("[%s] agent connected (no tailscale)", n.name)
@@ -1988,9 +1991,9 @@ func (e *Env) registerBinaries(goos, goarch string) {
 	}
 }
 
-// waitForAgentConn waits for a TTA agent to connect by issuing a simple
+// WaitForAgentConn waits for a TTA agent to connect by issuing a simple
 // HTTP GET to the root endpoint, without requiring tailscaled.
-func (e *Env) waitForAgentConn(ctx context.Context, n *Node) error {
+func (e *Env) WaitForAgentConn(ctx context.Context, n *Node) error {
 	for {
 		reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		req, err := http.NewRequestWithContext(reqCtx, "GET", "http://unused/", nil)
@@ -2002,6 +2005,9 @@ func (e *Env) waitForAgentConn(ctx context.Context, n *Node) error {
 		cancel()
 		if err == nil {
 			res.Body.Close()
+			// Close any idle connections left over. New requests will create new
+			// connections lazily rather than reusing existing connections.
+			n.agent.CloseIdleConnections()
 			return nil
 		}
 		if ctx.Err() != nil {
@@ -2306,17 +2312,17 @@ func classifyPing(pr *ipnstate.PingResult) PingRoute {
 // PingExpect retries disco pings until the result matches wantRoute or the
 // timeout is reached. It is using DiscoPings as this is the only ping type
 // that can classify the connection type.
-func (e *Env) PingExpect(from, to *Node, wantRoute PingRoute, timeout time.Duration) error {
+func (e *Env) PingExpect(from, to *Node, wantRoute PingRoute, timeout time.Duration) (string, error) {
 	e.t.Helper()
 	ctx, cancel := context.WithTimeout(e.t.Context(), timeout)
 	defer cancel()
 	var lastRoute PingRoute
 	toSt, err := to.agent.Status(ctx)
 	if err != nil {
-		return fmt.Errorf("ping: can't get %s status: %w", to.name, err)
+		return "", fmt.Errorf("ping: can't get %s status: %w", to.name, err)
 	}
 	if len(toSt.Self.TailscaleIPs) == 0 {
-		return fmt.Errorf("ping: %s has no Tailscale IPs", to.name)
+		return "", fmt.Errorf("ping: %s has no Tailscale IPs", to.name)
 	}
 	targetIP := toSt.Self.TailscaleIPs[0]
 	for ctx.Err() == nil {
@@ -2327,7 +2333,7 @@ func (e *Env) PingExpect(from, to *Node, wantRoute PingRoute, timeout time.Durat
 			got := classifyPing(pr)
 			e.t.Logf("Saw ping type %q", got)
 			if got == wantRoute {
-				return nil
+				return pr.Endpoint, nil
 			} else {
 				lastRoute = got
 			}
@@ -2337,7 +2343,7 @@ func (e *Env) PingExpect(from, to *Node, wantRoute PingRoute, timeout time.Durat
 		case <-ctx.Done():
 		}
 	}
-	return fmt.Errorf("ping route = %q, want %q (after %v)", lastRoute, wantRoute, timeout)
+	return "", fmt.Errorf("ping route = %q, want %q (after %v)", lastRoute, wantRoute, timeout)
 }
 
 // PingSettle retries disco pings every 1 second between nodes from -> to. The
@@ -2403,5 +2409,27 @@ func (e *Env) NumNodes() int {
 func (e *Env) DropControlTraffic(n *Node) {
 	for _, network := range n.nets {
 		network.BlackholeControlForAddr(n.LanIP(network))
+	}
+}
+
+// SetLinkUp sets the link status of a network for a node. Setting the link down
+// is equivalent to unplugging the network cable from the node, the interface
+// is still present on the node, the "media" is just lost.
+func (e *Env) SetLinkUp(n *Node, nw *vnet.Network, up bool) {
+	if n.os.IsGokrazy {
+		e.t.Fatal("SetLinkUp is not supported on gokrazy nodes")
+	}
+	ifIndex := -1
+	for i, nn := range n.vnetNode.Networks() {
+		if nw == nn {
+			ifIndex = i
+			break
+		}
+	}
+	if ifIndex == -1 {
+		e.t.Fatal("network not found for node")
+	}
+	if err := e.setLink(n, ifIndex, up); err != nil {
+		e.t.Fatalf("unable to set link status: %s", err.Error())
 	}
 }
