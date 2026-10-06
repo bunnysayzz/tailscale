@@ -49,6 +49,12 @@ func (f fsFileOps) OpenWriter(name string, offset int64, perm os.FileMode) (io.W
 	if err != nil {
 		return nil, "", err
 	}
+	if offset == 0 {
+		if err := fi.Truncate(0); err != nil {
+			fi.Close()
+			return nil, "", err
+		}
+	}
 	if offset != 0 {
 		curr, err := fi.Seek(0, io.SeekEnd)
 		if err != nil {
