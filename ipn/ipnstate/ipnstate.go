@@ -358,6 +358,7 @@ const (
 	TaildropTargetUnsupportedOS
 	TaildropTargetNoPeerAPI
 	TaildropTargetOwnedByOtherUser
+	TaildropTargetConsentRequired
 )
 
 // HasCap reports whether ps has the given capability.
