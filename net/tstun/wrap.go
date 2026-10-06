@@ -4,6 +4,7 @@
 package tstun
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -135,11 +136,11 @@ type Wrapper struct {
 
 	// closed signals the queues (by closing) when the device is closed.
 	closed chan struct{}
-	// outboundMu is held across injectOutbound's send, so that an injection
-	// queue nobody reads is visible to [Wrapper.ProbeLocks].
-	//
-	// TODO(illotum): can we signal deadlock to the watchdog without mu?
-	outboundMu sync.Mutex
+	// outboundMu serializes injection sends and channel closure. A one-slot
+	// semaphore allows cancellation while waiting to acquire
+	// it as well as while sending. Holding it across the send also makes an
+	// unread injection queue visible to [Wrapper.ProbeLocks].
+	outboundMu syncs.Semaphore
 
 	// eventsUpDown yields up and down tun.Events that arrive on a Wrapper's events channel.
 	eventsUpDown chan tun.Event
@@ -258,8 +259,8 @@ func (q *wrapperQueue) File() *os.File { return q.q.File() }
 type injectionQueue struct {
 	w *Wrapper
 
-	// ch carries injected packets to the reader.
-	// ch is never closed, senders and the reader select on [Wrapper.closed].
+	// ch carries injected packets to the reader. Wrapper.Close closes it
+	// under outboundMu, after signaling closed to unblock any active sender.
 	ch chan tunInjectedRead
 }
 
@@ -293,6 +294,7 @@ func wrap(logf logger.Logf, tdev tun.Device, isTAP bool, m *usermetric.Registry,
 		tdev:         tdev,
 		writeTo:      tun.WriteToOf(tdev),
 		closed:       make(chan struct{}),
+		outboundMu:   syncs.NewSemaphore(1),
 		eventsUpDown: make(chan tun.Event),
 		eventsOther:  make(chan tun.Event),
 		// TODO(dmytro): (highly rate-limited) hexdumps should happen on unknown packets.
@@ -370,12 +372,26 @@ func (t *Wrapper) Close() error {
 	var err error
 	t.closeOnce.Do(func() {
 		close(t.closed)
+		// Signal closed before acquiring outboundMu, so a sender blocked on
+		// a full queue can exit. Later senders check closed under outboundMu
+		// and cannot send on the closed injection channel.
+		t.outboundMu.Acquire()
+		close(t.injectionQueue.ch)
+		t.outboundMu.Release()
 		err = t.tdev.Close()
 		t.eventClient.Close()
 		if t.tunDevStatsCloser != nil {
 			t.tunDevStatsCloser.Close()
 		}
 	})
+	// Each buffered packet belongs to one consumer: a reader or a Close
+	// caller. Release outside closeOnce, after teardown, because packet
+	// release callbacks may reenter Close.
+	for r := range t.injectionQueue.ch {
+		if r.packet != nil {
+			r.packet.DecRef()
+		}
+	}
 	return err
 }
 
@@ -468,17 +484,46 @@ func (t *Wrapper) InjectionQueue() tun.Queue {
 	return t.injectionQueue
 }
 
-// injectOutbound hands r to the injection queue's reader, or releases it if
-// the Wrapper is closed.
-func (t *Wrapper) injectOutbound(r tunInjectedRead) {
-	t.outboundMu.Lock()
-	defer t.outboundMu.Unlock()
-	select {
-	case t.injectionQueue.ch <- r:
-	case <-t.closed:
-		if r.packet != nil {
+// injectOutbound takes ownership of r and either hands it to the injection
+// queue's reader or releases it if canceled or closed. Native readers cannot
+// make space in this handoff.
+func (t *Wrapper) injectOutbound(ctx context.Context, r tunInjectedRead) (err error) {
+	defer func() {
+		if err != nil && r.packet != nil {
 			r.packet.DecRef()
 		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	immediate := t.outboundMu.TryAcquire()
+	if !immediate && !t.outboundMu.AcquireContext(ctx) {
+		return ctx.Err()
+	}
+	defer t.outboundMu.Release()
+	if t.isClosed() {
+		return ErrClosed
+	}
+	if !immediate {
+		// Acquisition and cancellation can become ready together.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	// Most injections have room immediately; only involve cancellation
+	// channels when the handoff would otherwise block.
+	select {
+	case t.injectionQueue.ch <- r:
+		return nil
+	default:
+	}
+	select {
+	case t.injectionQueue.ch <- r:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.closed:
+		return ErrClosed
 	}
 }
 
@@ -782,10 +827,10 @@ func (t *Wrapper) IdleDuration() time.Duration {
 	return mono.Since(t.lastActivityAtomic.LoadAtomic())
 }
 
-// ProbeLocks acquires and releases Wrapper's internal mutexes.
+// ProbeLocks acquires and releases Wrapper's internal locks.
 func (t *Wrapper) ProbeLocks() {
-	t.outboundMu.Lock()
-	t.outboundMu.Unlock()
+	t.outboundMu.Acquire()
+	t.outboundMu.Release()
 }
 
 func (t *Wrapper) awaitStart() {
@@ -889,10 +934,8 @@ func (q *injectionQueue) Read(slab []byte, packets []tun.ReadPacket) (int, error
 	if !t.started.Load() {
 		t.awaitStart()
 	}
-	var r tunInjectedRead
-	select {
-	case r = <-q.ch:
-	case <-t.closed:
+	r, ok := <-q.ch
+	if !ok {
 		return 0, io.EOF
 	}
 	return t.injectedRead(r, slab, packets, tun.ReadPacketSpacing)
@@ -981,7 +1024,20 @@ func (t *Wrapper) injectedRead(res tunInjectedRead, slab []byte, packets []tun.R
 		}
 		bufN := copy(pkt, res.packet.NetworkHeader().Slice())
 		bufN += copy(pkt[bufN:], res.packet.TransportHeader().Slice())
-		bufN += copy(pkt[bufN:], res.packet.Data().AsRange().ToSlice())
+		// Copy the payload directly from its backing views. ToSlice would
+		// allocate an intermediate payload and copy the bytes twice.
+		views, offset := res.packet.AsViewList()
+		// AsViewList's offset points at the first header; skip all headers
+		// (including link/virtio headers) to reach the start of Data.
+		offset += res.packet.HeaderSize()
+		for v := views.Front(); v != nil; v = v.Next() {
+			if offset >= v.Size() {
+				offset -= v.Size()
+				continue
+			}
+			bufN += copy(pkt[bufN:], v.AsSlice()[offset:])
+			offset = 0
+		}
 		gso = res.packet.GSOOptions
 		pkt = pkt[:bufN]
 		defer res.packet.DecRef() // defer DecRef so we may continue to reference it
@@ -1443,25 +1499,38 @@ func (t *Wrapper) injectOutboundPong(pp *packet.Parsed, req packet.TSMPPingReque
 
 // InjectOutbound makes the Wrapper device behave as if a packet
 // with the given contents was sent to the network.
-// It does not block, but takes ownership of the packet.
+// It blocks until the packet can be queued or the Wrapper closes, and takes
+// ownership of the packet. Only reads from InjectionQueue can make space.
 // The injected packet will not pass through outbound filter rules,
 // but UDP/SCTP flow state is recorded so inbound replies are admitted.
 // Injecting an empty packet is a no-op.
 func (t *Wrapper) InjectOutbound(pkt []byte) error {
+	return t.InjectOutboundContext(context.Background(), pkt)
+}
+
+// InjectOutboundContext is InjectOutbound with a cancellable wait for queue
+// space. Cancellation does not retract a packet that has already been queued.
+func (t *Wrapper) InjectOutboundContext(ctx context.Context, pkt []byte) error {
 	if len(pkt) > MaxPacketSize {
 		return errPacketTooBig
 	}
 	if len(pkt) == 0 {
 		return nil
 	}
-	t.injectOutbound(tunInjectedRead{data: pkt})
-	return nil
+	return t.injectOutbound(ctx, tunInjectedRead{data: pkt})
 }
 
-// InjectOutboundPacketBuffer logically behaves as InjectOutbound. It takes ownership of one
-// reference count on the packet, and the packet may be mutated. The packet refcount will be
-// decremented after the injected buffer has been read.
+// InjectOutboundPacketBuffer is InjectOutbound for a PacketBuffer. It takes
+// ownership of one reference even on error. The packet may be mutated, and its
+// reference is released after InjectionQueue consumes it or the Wrapper discards it.
 func (t *Wrapper) InjectOutboundPacketBuffer(pkt *netstack_PacketBuffer) error {
+	return t.InjectOutboundPacketBufferContext(context.Background(), pkt)
+}
+
+// InjectOutboundPacketBufferContext is InjectOutboundPacketBuffer with a
+// cancellable wait for queue space. Cancellation does not retract a packet that
+// has already been queued. It takes ownership of one reference even on error.
+func (t *Wrapper) InjectOutboundPacketBufferContext(ctx context.Context, pkt *netstack_PacketBuffer) error {
 	if !buildfeatures.HasNetstack {
 		panic("unreachable")
 	}
@@ -1477,10 +1546,10 @@ func (t *Wrapper) InjectOutboundPacketBuffer(pkt *netstack_PacketBuffer) error {
 	if capt := t.captureHook.Load(); capt != nil {
 		b := pkt.ToBuffer()
 		capt(packet.SynthesizedToPeer, t.now(), b.Flatten(), packet.CaptureMeta{})
+		b.Release()
 	}
 
-	t.injectOutbound(tunInjectedRead{packet: pkt})
-	return nil
+	return t.injectOutbound(ctx, tunInjectedRead{packet: pkt})
 }
 
 func (t *Wrapper) BatchSize() int {

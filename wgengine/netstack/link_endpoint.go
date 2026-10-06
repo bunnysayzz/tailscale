@@ -5,6 +5,7 @@ package netstack
 
 import (
 	"context"
+	"expvar"
 	"fmt"
 	"sync"
 
@@ -73,6 +74,12 @@ func (q *queue) Write(pkt *stack.PacketBuffer) tcpip.Error {
 	case <-q.closedCh:
 		pkt.DecRef()
 		return &tcpip.ErrClosedForSend{}
+	default:
+		// Packet processing can synchronously generate a reply on the TUN
+		// reader or loopback consumer. Neither may wait for queue space:
+		// draining the queue can depend on that same goroutine.
+		pkt.DecRef() // balance the IncRef evaluated before selecting a case
+		return &tcpip.ErrNoBufferSpace{}
 	}
 }
 
@@ -139,6 +146,11 @@ type linkEndpoint struct {
 	mtu        uint32
 
 	outboundQueues [outboundQueueLimit]*queue // outbound
+
+	// outboundQueueFullDropped counts packets not accepted by WritePackets
+	// because an outbound queue was full, including the unaccepted batch tail.
+	// These are PacketBuffers, which may contain multiple segments with GSO.
+	outboundQueueFullDropped expvar.Int
 }
 
 // newLinkEndpoint constructs a [*linkEndpoint]. size is applied independently
@@ -376,7 +388,9 @@ func (ep *linkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Er
 			panic(fmt.Sprintf("linkEndpoint.outboundQueueRouter returned %v which is outside outboundQueueLimit(%v)", q, outboundQueueLimit))
 		}
 		if err := ep.outboundQueues[q].Write(pkt); err != nil {
-			if _, ok := err.(*tcpip.ErrNoBufferSpace); !ok && n == 0 {
+			if _, ok := err.(*tcpip.ErrNoBufferSpace); ok {
+				ep.outboundQueueFullDropped.Add(int64(pkts.Len() - n))
+			} else if n == 0 {
 				return 0, err
 			}
 			break
