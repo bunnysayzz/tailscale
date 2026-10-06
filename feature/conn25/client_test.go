@@ -5,7 +5,9 @@ package conn25
 
 import (
 	"errors"
+	"fmt"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -497,4 +499,68 @@ func TestAddressExpiryDependsOnActiveFlows(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestResendTransitIPMappingConcurrent races resendTransitIPMapping, which the
+// datapath calls on the WireGuard inbound goroutine when a connector rejects a
+// packet for an unmapped transit IP, against reserveAddresses, which runs on
+// the DNS goroutine. Both touch client.assignments, so without the mutex this
+// is a fatal concurrent map read and map write.
+func TestResendTransitIPMappingConcurrent(t *testing.T) {
+	const appName = "a"
+	conn25 := newConn25(logger.Discard)
+	c := conn25.client
+	c.v4MagicIPPool = newIPPool(mustIPSetFromPrefix("100.64.0.0/16"))
+	c.v4TransitIPPool = newIPPool(mustIPSetFromPrefix("169.254.0.0/16"))
+
+	// Nothing consumes addrsCh in a unit test, so drain it to keep
+	// reserveAddresses from failing once the queue fills.
+	stopDrain := make(chan struct{})
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for {
+			select {
+			case <-c.addrsCh:
+			case <-stopDrain:
+				return
+			}
+		}
+	}()
+
+	// Reserve one long-lived mapping so the resending goroutine takes the
+	// found path, not just the miss path.
+	known, err := c.reserveAddresses(appName, "example.com.", netip.MustParseAddr("1.2.3.4"), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	knownTransit := known.transit
+
+	// Short TTLs on the churn entries so reserveAddresses also exercises
+	// popExpired, which deletes from the same maps.
+	const iters = 2000
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for i := range iters {
+			domain := must.Get(dnsname.ToFQDN(fmt.Sprintf("h%d.example.com.", i)))
+			dst := netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 1})
+			// errQueueFull just means the drain goroutine fell behind; the assignment still
+			// went through the maps, which is what we're racing against.
+			_, err := c.reserveAddresses(appName, domain, dst, time.Nanosecond)
+			if err != nil && !errors.Is(err, errQueueFull) {
+				t.Errorf("reserveAddresses(%v): %v", domain, err)
+				return
+			}
+		}
+	})
+	wg.Go(func() {
+		for range iters {
+			c.resendTransitIPMapping(knownTransit)
+		}
+	})
+	wg.Wait()
+
+	close(stopDrain)
+	<-drained
 }
