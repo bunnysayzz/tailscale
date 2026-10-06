@@ -58,8 +58,6 @@ func (c *client) transitIPForMagicIP(magicIP netip.Addr) (netip.Addr, bool) {
 // but conn25 uses link-local addresses for transit IPs.
 // Let the filter know if this is one of our addresses and should be allowed.
 func (c *client) linkLocalAllow(p packet.Parsed) (bool, string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	ok := c.isKnownTransitIP(p.Dst.Addr())
 	if ok {
 		return true, packetFilterAllowReason
@@ -68,6 +66,8 @@ func (c *client) linkLocalAllow(p packet.Parsed) (bool, string) {
 }
 
 func (c *client) isKnownTransitIP(tip netip.Addr) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	_, ok := c.assignments.lookupByTransitIP(tip)
 	return ok
 }
@@ -183,8 +183,6 @@ func (c *client) addTransitIPForConnector(tip netip.Addr, conn tailcfg.NodeView)
 		return fmt.Errorf("node with stable ID %q does not have a key", conn.StableID())
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	return c.insertTransitConnMapping(tip, conn.Key())
 }
 
@@ -228,8 +226,6 @@ func (c *client) flowRemoved(transit netip.Addr) {
 }
 
 func (c *client) extraWireGuardAllowedIPs(k key.NodePublic) views.Slice[netip.Prefix] {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	tips, ok := c.lookupTransitIPsByConnKey(k)
 	if !ok {
 		return views.Slice[netip.Prefix]{}
@@ -315,6 +311,8 @@ func (as addrs) is6() bool {
 // for the provided transitIP (as a prefix).
 // The provided transitIP must already be present in the byTransitIP map.
 func (c *client) insertTransitConnMapping(tip netip.Addr, connKey key.NodePublic) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if _, ok := c.assignments.lookupByTransitIP(tip); !ok {
 		return errors.New("transit IP is not already known")
 	}
@@ -333,6 +331,8 @@ func (c *client) insertTransitConnMapping(tip netip.Addr, connKey key.NodePublic
 // associated with the given connector (identified by node key), or (nil, false) if there is no entry
 // for the given key.
 func (c *client) lookupTransitIPsByConnKey(k key.NodePublic) ([]netip.Prefix, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	s, ok := c.byConnKey[k]
 	if !ok {
 		return nil, false
